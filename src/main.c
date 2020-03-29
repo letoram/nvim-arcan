@@ -1,5 +1,10 @@
 /*
  * TUI based UI frontend for NeoVIM
+ *  - 1. highlight
+ *  - 2. special input
+ *  - 3. scroll region
+ *  - 4. 'q' requires step before dying
+ *
  * - options to explore:
  *   - msgpack writer to debug window
  *   - split to new window
@@ -247,9 +252,15 @@ static bool draw_line(int gid,
 		if (cell->ptr[0].type != MSGPACK_OBJECT_STR)
 			return false;
 
-		arcan_tui_writeu8(grid,
-			(uint8_t*) cell->ptr[0].via.str.ptr,
-			cell->ptr[0].via.str.size, NULL);
+		size_t count = 1;
+		if (cell->size == 3)
+			count = cell->ptr[2].via.u64;
+
+		for (size_t i = 0; i < count; i++)
+			arcan_tui_writeu8(grid,
+				(uint8_t*) cell->ptr[0].via.str.ptr,
+				cell->ptr[0].via.str.size, NULL
+			);
 	}
 	return true;
 }
