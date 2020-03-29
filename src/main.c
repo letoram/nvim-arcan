@@ -18,10 +18,20 @@
 #include <pthread.h>
 #include <errno.h>
 
+#include "uthash.h"
+
 #ifndef COUNT_OF
 #define COUNT_OF(x) \
 	((sizeof(x)/sizeof(0[x])) / ((size_t)(!(sizeof(x) % sizeof(0[x])))))
 #endif
+
+struct hl_state {
+	struct tui_screen_attr attr;
+	uint64_t id;
+	UT_hash_handle hh;
+};
+
+static struct hl_state* highlights;
 
 static struct {
 /* mutex around packer out */
@@ -43,7 +53,7 @@ static inline void trace(const char* msg, ...)
 	va_start( args, msg );
 		vfprintf(stderr,  msg, args );
 	va_end( args);
-	fprintf(stderr, "\n");
+	fputs("\n", stderr);
 #endif
 }
 
@@ -244,6 +254,8 @@ static bool draw_line(int gid,
  * 3 items : [ch, hlid, repeat]
  *
  * if hlid is not set, grab the last defined one - global */
+	struct tui_screen_attr attr = arcan_tui_defattr(grid, NULL);
+
 	for (size_t i = 0; i < line->size; i++){
 		if (line->ptr[i].type != MSGPACK_OBJECT_ARRAY)
 			return false;
@@ -253,13 +265,25 @@ static bool draw_line(int gid,
 			return false;
 
 		size_t count = 1;
+		if (cell->size > 1){
+			struct hl_state* hl;
+			HASH_FIND_INT(highlights, &cell->ptr[1].via.u64, hl);
+			if (hl){
+				attr = hl->attr;
+			}
+			else{
+				printf("missing hl: %"PRIu64"\n", cell->ptr[1].via.u64);
+				attr = arcan_tui_defattr(grid, NULL);
+			}
+		}
+
 		if (cell->size == 3)
 			count = cell->ptr[2].via.u64;
 
 		for (size_t i = 0; i < count; i++)
 			arcan_tui_writeu8(grid,
 				(uint8_t*) cell->ptr[0].via.str.ptr,
-				cell->ptr[0].via.str.size, NULL
+				cell->ptr[0].via.str.size, &attr
 			);
 	}
 	return true;
@@ -341,13 +365,100 @@ static bool grid_goto(const msgpack_object_array* arg)
 	return true;
 }
 
+static void update_cval(uint64_t val, uint8_t rgb[static 3])
+{
+	if ((uint64_t)-1 == val){
+		struct tui_screen_attr attr = arcan_tui_defattr(nvim.grids[0], NULL);
+		rgb[0] = attr.fc[0];
+		rgb[1] = attr.fc[1];
+		rgb[2] = attr.fc[2];
+	}
+	else {
+		rgb[2] = (val & 0x000000ff);
+		rgb[1] = (val & 0x0000ff00) >>  8;
+		rgb[0] = (val & 0x00ff0000) >> 16;
+	}
+}
+
+static bool highlight_attribute(const msgpack_object_array* arg)
+{
+	for (size_t i = 1; i < arg->size; i++){
+		struct hl_state* state;
+		const msgpack_object_array* ci = &arg->ptr[i].via.array;
+		uint64_t attrid = ci->ptr[0].via.u64;
+
+/* fetch or add, set default */
+		HASH_FIND_INT(highlights, &attrid, state);
+		if (!state){
+			state = malloc(sizeof(struct hl_state));
+			state->attr = arcan_tui_defattr(nvim.grids[0], NULL);
+			state->id = attrid;
+			HASH_ADD_INT(highlights, id, state);
+		}
+
+/* should be size [4],
+ * id (u64), rgb (use this), cterm (ignore this), info (use this) */
+		if (ci->size != 4){
+			trace("hl_attr_define expected [id, rgb, term, info], got: %zu", ci->size);
+			continue;
+		}
+
+		if (ci->ptr[1].type != MSGPACK_OBJECT_MAP){
+			trace("hl_attr_define [rgb] not a map");
+			continue;
+		}
+
+/* foreground or background? */
+		const msgpack_object_map* cm = &ci->ptr[1].via.map;
+		for (size_t j = 0; j < cm->size; j++){
+			if (cm->ptr[j].key.type != MSGPACK_OBJECT_STR ||
+					cm->ptr[j].val.type != MSGPACK_OBJECT_POSITIVE_INTEGER)
+				continue;
+
+			if (nvim_str_match(&cm->ptr[j].key.via.str, "foreground")){
+				uint64_t val = cm->ptr[j].val.via.u64;
+				update_cval(val, state->attr.fc);
+			}
+			else if (nvim_str_match(&cm->ptr[j].key.via.str, "background")){
+				uint64_t val = cm->ptr[j].val.via.u64;
+				update_cval(val, state->attr.bc);
+			}
+			else
+				msgpack_object_print(stderr, cm->ptr[j].key);
+/*
+ * special:
+ * reverse: (color on underline / undercurl)
+ * italic: bool
+ * bold: bool
+ * strikethrough: bool
+ * underline: bool
+ * undercurl: bool
+ * blend: transparency 0-100 */
+		}
+
+		return true;
+	}
+
+	return true;
+}
+
+static bool highlight_defcol(const msgpack_object_array* arg)
+{
+/*default colors: rgb_fg, rgb_bg, rgb_sp, cterm_fg, cterm_bg */
+	return true;
+}
+
 static const struct nvim_cmd redraw_cmds[] = {
 	{"grid_resize", draw_resize},
 	{"grid_line", draw_lines},
 	{"grid_destroy", draw_destroy},
 	{"grid_clear", grid_clear},
 	{"grid_cursor_goto", grid_goto},
+	{"hl_attr_define", highlight_attribute},
+	{"default_colors_set", highlight_defcol},
 /* option_set
+ * set_scroll_region [top, bottom, left, right]
+ * grid_scroll [id, top, bot, left, right, rows, cols] n rows direction, - down
  * default_colors_set
  * hl_attr_define
  * hl_group_set
