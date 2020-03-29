@@ -11,6 +11,7 @@
 #include <errno.h>
 #include <msgpack.h>
 #include <pthread.h>
+#include <errno.h>
 
 #ifndef COUNT_OF
 #define COUNT_OF(x) \
@@ -37,6 +38,18 @@ static inline void trace(const char* msg, ...)
 	va_start( args, msg );
 		vfprintf(stderr,  msg, args );
 	va_end( args);
+	fprintf(stderr, "\n");
+#endif
+}
+
+static void trace_obj_array(const msgpack_object_array* arg)
+{
+#ifdef TRACE_ENABLE
+	struct msgpack_object obj = {
+		.type = MSGPACK_OBJECT_ARRAY,
+		.via.array = *arg
+	};
+	msgpack_object_print(stderr, obj);
 	fprintf(stderr, "\n");
 #endif
 }
@@ -113,8 +126,8 @@ static void on_key(struct tui_context* c, uint32_t xkeysym,
 	uint8_t scancode, uint8_t mods, uint16_t subid, void* t)
 {
 	trace("unknown_key(%"PRIu32",%"PRIu8",%"PRIu16")", xkeysym, scancode, subid);
-/* lock,
- * api_input(keys, size)
+/*
+ * these need to be translated based on sym and mods
  */
 }
 
@@ -122,7 +135,13 @@ static bool on_u8(struct tui_context* c, const char* u8, size_t len, void* t)
 {
 	uint8_t buf[5] = {0};
 	memcpy(buf, u8, len >= 5 ? 4 : len);
-	trace("utf8-input: %s", buf);
+	trace("on_u8(%zu:%s)", len, buf);
+
+	const char cmd[] = "nvim_input";
+	nvim_request_str(cmd, sizeof(cmd) - 1);
+	msgpack_pack_array(nvim.out, 1);
+	msgpack_pack_str(nvim.out, len);
+	msgpack_pack_str_body(nvim.out, u8, len);
 
 /* nvim_put: lines[], tyoe[block, char, line], [after], [follow] */
 	return true;
@@ -173,18 +192,15 @@ static void on_resize(struct tui_context* c,
 {
 	trace("resize(%zu(%zu),%zu(%zu))", neww, col, newh, row);
 	struct nvim_meta* m = t;
+	if (!nvim.out)
+		return;
 
-	if (nvim.out){
-		const char cmd[] = "nvim_ui_try_resize_grid";
-		nvim_request_str(cmd, sizeof(cmd) - 1);
-		msgpack_pack_array(nvim.out, 3);
-		msgpack_pack_int(nvim.out, m->grid_id);
-		msgpack_pack_int64(nvim.out, col);
-		msgpack_pack_int64(nvim.out, row);
-	}
-
-	arcan_tui_erase_screen(c, false);
-/* repopulate with contents from linebuffer awaiting the update from nvim */
+	const char cmd[] = "nvim_ui_try_resize_grid";
+	nvim_request_str(cmd, sizeof(cmd) - 1);
+	msgpack_pack_array(nvim.out, 3);
+	msgpack_pack_int(nvim.out, m->grid_id);
+	msgpack_pack_int64(nvim.out, col);
+	msgpack_pack_int64(nvim.out, row);
 }
 
 struct nvim_cmd {
@@ -192,14 +208,15 @@ struct nvim_cmd {
 	bool (*ptr)(const msgpack_object_array* arg);
 };
 
+/* this comes from the notifications, so it expects it to be of
+ * [cmd, [grid, ...]] */
 static struct tui_context* nvim_grid_to_tui(const msgpack_object_array* arg)
 {
 	if (arg->size < 2 ||
 		arg->ptr[1].type != MSGPACK_OBJECT_ARRAY ||
 		arg->ptr[1].via.array.size < 1 ||
-		arg->ptr[1].via.array.ptr[0].type != MSGPACK_OBJECT_POSITIVE_INTEGER){
+		arg->ptr[1].via.array.ptr[0].type != MSGPACK_OBJECT_POSITIVE_INTEGER)
 		return NULL;
-	}
 /* incomplete, need to map grid to active context */
 	return nvim.grids[0];
 }
@@ -210,40 +227,67 @@ static bool draw_resize(const msgpack_object_array* arg)
 	return true;
 }
 
-static bool draw_line(const msgpack_object_array* arg)
+static bool draw_line(int gid,
+	unsigned row, unsigned offset, const msgpack_object_array* line)
 {
-	struct tui_context* tui = nvim_grid_to_tui(arg);
-	if (!tui || arg->size < 2)
-		return false;
+	struct tui_context* grid = nvim.grids[0];
+	arcan_tui_move_to(grid, offset, row);
 
-	struct tui_screen_attr attr;
-	arcan_tui_defattr(tui, &attr);
+/* format depends on individual line size:
+ * 1 item  : [ch]
+ * 2 items : [ch, hlid]
+ * 3 items : [ch, hlid, repeat]
+ *
+ * if hlid is not set, grab the last defined one - global */
+	for (size_t i = 0; i < line->size; i++){
+		if (line->ptr[i].type != MSGPACK_OBJECT_ARRAY)
+			return false;
+		const msgpack_object_array* cell = &line->ptr[i].via.array;
 
-	if (arg->ptr[1].type != MSGPACK_OBJECT_ARRAY)
-		return false;
-
-	const msgpack_object_array* lines = &arg->ptr[1].via.array;
-	for (size_t line = 0; line < lines->size; line++){
-		if (lines->ptr[line].type != MSGPACK_OBJECT_ARRAY ||
-				lines->ptr[line].via.array.size != 4)
+		if (cell->ptr[0].type != MSGPACK_OBJECT_STR)
 			return false;
 
-		size_t col = 0;
-		size_t row = 0;
-		size_t text_sz = 0;
-		char* text = NULL;
+		arcan_tui_writeu8(grid,
+			(uint8_t*) cell->ptr[0].via.str.ptr,
+			cell->ptr[0].via.str.size, NULL);
+	}
+	return true;
+}
 
-		const msgpack_object_array* linedata = &lines->ptr[line].via.array;
-		if (linedata[0].ptr[0].type != MSGPACK_OBJECT_POSITIVE_INTEGER){
-			abort();
-		}
+static bool draw_lines(const msgpack_object_array* arg)
+{
+/* arg is array with command as first element,
+ * all other elements are arrays representing a line */
 
-/* array of lines, each starting with:
- * [grid : int, row : int, col : int, cells : array]
- * [cell : text, hl_id, repeat ] */
+	for (size_t line = 1; line < arg->size; line++){
+		if (arg->ptr[line].type != MSGPACK_OBJECT_ARRAY)
+			continue;
 
-		arcan_tui_move_to(tui, col, row);
-		arcan_tui_writeu8(tui, (const uint8_t*)text, text_sz, &attr);
+		const msgpack_object_array* l = &arg->ptr[line].via.array;
+		if (l->size != 4)
+			return false;
+
+/* invalid grid number argument */
+		if (l->ptr[0].type != MSGPACK_OBJECT_POSITIVE_INTEGER)
+			return false;
+
+		uint64_t grid = l->ptr[0].via.u64;
+
+/* invalid start row argument */
+		if (l->ptr[1].type != MSGPACK_OBJECT_POSITIVE_INTEGER)
+			return false;
+
+		uint64_t row = l->ptr[1].via.u64;
+
+/* invalid start row argument */
+		if (l->ptr[2].type != MSGPACK_OBJECT_POSITIVE_INTEGER)
+			return false;
+
+		uint64_t col = l->ptr[2].via.u64;
+
+		if (!draw_line(grid, row, col, &l->ptr[3].via.array))
+			return false;
+/* rest is array of characters */
 	}
 
 	return true;
@@ -264,25 +308,49 @@ static bool draw_destroy(const msgpack_object_array* arg)
 	return true;
 }
 
+static bool grid_goto(const msgpack_object_array* arg)
+{
+	struct tui_context* grid = nvim_grid_to_tui(arg);
+/* can now assume [cmd, [gid, ...] structure */
+
+	const msgpack_object_array* gargs = &arg->ptr[1].via.array;
+	if (gargs->size != 3)
+		return false;
+
+	if (gargs->ptr[1].type != MSGPACK_OBJECT_POSITIVE_INTEGER)
+		return false;
+	uint64_t row = gargs->ptr[1].via.u64;
+
+	if (gargs->ptr[2].type != MSGPACK_OBJECT_POSITIVE_INTEGER)
+		return false;
+	uint64_t col = gargs->ptr[2].via.u64;
+
+	arcan_tui_move_to(grid, col, row);
+
+	return true;
+}
+
 static const struct nvim_cmd redraw_cmds[] = {
 	{"grid_resize", draw_resize},
-	{"grid_line", draw_line},
+	{"grid_line", draw_lines},
 	{"grid_destroy", draw_destroy},
 	{"grid_clear", grid_clear},
+	{"grid_cursor_goto", grid_goto},
 /* option_set
  * default_colors_set
  * hl_attr_define
  * hl_group_set
  * grid_clear
- * set_icon
- * set_title
- * grid_cursor_goto
- * mode_info_set
+ * set_icon (minimized title)
+ * set_titl (normal title)
+ * mode_info_set (cursor-shape, cursor-size
  * mode_change
- * flush
+ * flush [release mutex / allow refresh ]
  * mouse_on,
  * busy_start
- * busy_stop */
+ * busy_stop
+ * bell / visual_bell -> alert
+ */
 };
 
 static void nvim_redraw(const msgpack_object_array* arg)
@@ -303,7 +371,7 @@ static void nvim_redraw(const msgpack_object_array* arg)
 		for (size_t j = 0; j < COUNT_OF(redraw_cmds); j++){
 			if (nvim_str_match(str, redraw_cmds[j].lbl)){
 				found = true;
-				if (!redraw_cmds[j].ptr(&arg->ptr[i].via.array)){
+				if (!redraw_cmds[j].ptr(iarg)){
 					trace("parsing failed on redraw:%.*s", str->size, str->ptr);
 				}
 
@@ -322,6 +390,7 @@ static void on_notification(msgpack_object_str* cmd, const msgpack_object_array*
 	if (nvim_str_match(cmd, "redraw")){
 		nvim_redraw(arg);
 	}
+/* win-close, win-hide : find grid, close it (unless primary) */
 	else{
 		trace("unhandled-notification: %s", cmd->ptr);
 	}
@@ -337,29 +406,32 @@ static int mpack_to_nvim(void* data, const char* buf, unsigned long buf_out)
 
 static void* thread_input(void* data)
 {
-	FILE* fin = data;
+	int fdin = *(int*)data;
 
 	static msgpack_unpacker unpack;
 	msgpack_unpacker_init(&unpack, MSGPACK_UNPACKER_INIT_BUFFER_SIZE);
 
 /* doubt the buffering here is correct in the case where we don't get
  * a complete request, buffer_capacity increase */
-	while(!feof(fin)){
-		msgpack_unpacker_reserve_buffer(&unpack, 4096);
-		size_t nr = fread(msgpack_unpacker_buffer(&unpack), 1, 4096, fin);
+	for(;;){
+		ssize_t sz = msgpack_unpacker_buffer_capacity(&unpack);
+		void* buffer = msgpack_unpacker_buffer(&unpack);
+
+		ssize_t nr;
+		if (-1 == (nr = read(fdin, buffer, sz))){
+			if (errno == EAGAIN || errno == EINTR)
+				continue;
+			break;
+		}
+
 		msgpack_unpacker_buffer_consumed(&unpack, nr);
 
+/* read as much as possible, see if we run into a continue */
 		msgpack_unpacked result;
 		msgpack_unpacked_init(&result);
 
-/* array:
- * type, function, arg, ...
- * for redraw:
- * grid_resize (?, w, h)
- * grid_line,
- * also, semantic mode: ui-ext-options and ui.txt
- */
-		while (msgpack_unpacker_next(&unpack, &result)){
+		int res;
+		while ((res = msgpack_unpacker_next(&unpack, &result))){
 			const msgpack_object* const o = &result.data;
 			const msgpack_object_array* const args = &(o->via.array);
 			if (args->size != 3 && args->size != 4){
@@ -376,7 +448,8 @@ static void* thread_input(void* data)
  * careful with UAFs against de-allocated segments */
 			break;
 			case 2:
-				msgpack_object_print(stdout, *o);
+/*			msgpack_object_print(stdout, *o);
+				fflush(stdout); */
 				if (args->ptr[1].type == MSGPACK_OBJECT_STR &&
 						args->ptr[2].type == MSGPACK_OBJECT_ARRAY){
 					on_notification(&args->ptr[1].via.str, &args->ptr[2].via.array);
@@ -393,11 +466,11 @@ static void* thread_input(void* data)
 		msgpack_unpacked_destroy(&result);
 	}
 
-	fclose(fin);
+	close(fdin);
 	return NULL;
 }
 
-static bool setup_nvim_process(int argc, char** argv, FILE** in, FILE** out)
+static bool setup_nvim_process(int argc, char** argv, int* in, FILE** out)
 {
 /* pipe-pair and map to new process stdin/stdout, wrap around FILE abstractions
  * for use here - process input in one pipe, output in the other */
@@ -407,19 +480,15 @@ static bool setup_nvim_process(int argc, char** argv, FILE** in, FILE** out)
 	if (-1 == pipe(pipe_output))
 		return false;
 
-	if (!(*in = fdopen(pipe_output[0], "r"))){
-		close(pipe_output[0]);
-		close(pipe_output[1]);
-		return false;
-	}
+	*in = pipe_output[0];
 
 	if (-1 == pipe(pipe_input)){
-		fclose(*in);
+		close(*in);
 		close(pipe_output[1]);
 		return false;
 	}
 	if (!(*out = fdopen(pipe_input[1], "w"))){
-		fclose(*in);
+		close(*in);
 		close(pipe_input[0]);
 		close(pipe_input[1]);
 		return false;
@@ -428,7 +497,7 @@ static bool setup_nvim_process(int argc, char** argv, FILE** in, FILE** out)
 	pid_t nvim_pid = fork();
 
 	if (0 == nvim_pid){
-		fclose(*in);
+		close(*in);
 		fclose(*out);
 
 		if (-1 == dup2(pipe_input[0], STDIN_FILENO) ||
@@ -455,7 +524,7 @@ static bool setup_nvim_process(int argc, char** argv, FILE** in, FILE** out)
 	close(pipe_output[1]);
 
 	if (-1 == nvim_pid){
-		fclose(*in);
+		close(*in);
 		fclose(*out);
 		return false;
 	}
@@ -471,7 +540,7 @@ static void setup_nvim_ui()
 	msgpack_pack_int64(nvim.out, 128);
 	msgpack_pack_int64(nvim.out, 32);
 
-	msgpack_pack_map(nvim.out, 3);
+	msgpack_pack_map(nvim.out, 2);
 
 /* truecolor of course */
 	{
@@ -487,12 +556,19 @@ static void setup_nvim_ui()
 	msgpack_pack_true(nvim.out);
 	}
 
-/* we can deal with multiple grids (one mapped to a segment) */
+/* we can deal with multiple grids (one mapped to a segment)
+ *
 	{
 	msgpack_pack_str(nvim.out, 13);
 	msgpack_pack_str_body(nvim.out, "ext_multigrid", 13);
 	msgpack_pack_true(nvim.out);
 	}
+ */
+
+/*
+ * ext_messages to avoid a grid being used for that
+ *
+ */
 
 /* ext_popupmenu? ext_tabline? */
 }
@@ -537,7 +613,8 @@ int main(int argc, char** argv)
 		return EXIT_FAILURE;
 	}
 
-	FILE* data_out, (* data_in);
+	FILE* data_out;
+	int data_in;
 	if (!setup_nvim_process(argc-1, &argv[1], &data_in, &data_out)){
 		arcan_tui_destroy(nvim.grids[0], "couldn't spawn neovim");
 		return EXIT_FAILURE;
@@ -553,7 +630,7 @@ int main(int argc, char** argv)
 	pthread_attr_init(&pthattr);
 	pthread_attr_setdetachstate(&pthattr, PTHREAD_CREATE_DETACHED);
 
-	if (-1 == pthread_create(&pth, &pthattr, thread_input, data_in)){
+	if (-1 == pthread_create(&pth, &pthattr, thread_input, &data_in)){
 		arcan_tui_destroy(nvim.grids[0], "input thread creation failed");
 		return EXIT_FAILURE;
 	}
