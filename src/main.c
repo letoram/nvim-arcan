@@ -1,13 +1,14 @@
 /*
  * TUI based UI frontend for NeoVIM
- *  - 1. highlight
- *  - 2. special input
- *  - 3. scroll region
- *  - 4. 'q' requires step before dying
+ * Missing / basic things:
+ *  - default / background option attribute not set
+ *  - mouse input forwarding
+ *  - meta + input translation C-a etc.
+ *  - clipboard action
+ *  - setting title
  *
  * - options to explore:
- *   - msgpack writer to debug window
- *   - split to new window
+ *  - multiple grids
  */
 #include <arcan_shmif.h>
 #include <arcan_tui.h>
@@ -343,6 +344,80 @@ static bool draw_destroy(const msgpack_object_array* arg)
 	return true;
 }
 
+static void copy_row(
+	struct tui_context* T, size_t l, size_t r, size_t src, size_t dst)
+{
+	arcan_tui_move_to(T, l, dst);
+	for (size_t col = l; col < r; col++){
+		struct tui_cell cell = arcan_tui_getxy(T, col, src, true);
+/* this might be a bug with tui, investigate - sometimes cells with
+ * zero content won't get cleared / updated, this might be tied to some
+ * terminal emulator visual leftovers we have had in the past */
+		if (!cell.ch)
+			cell.ch = ' ';
+
+		arcan_tui_write(T, cell.ch, &cell.attr);
+	}
+}
+
+static bool grid_scroll(const msgpack_object_array* arg)
+{
+	struct tui_context* grid = nvim_grid_to_tui(arg);
+	if (arg->size != 2 || arg->ptr[1].via.array.size != 7)
+		return false;
+
+/* id, top, bottom, left, right, rows, cols */
+	const msgpack_object_array* args = &arg->ptr[1].via.array;
+	int64_t t, b, l, r, rows, cols;
+
+	if (args->ptr[1].type != MSGPACK_OBJECT_POSITIVE_INTEGER)
+		return false;
+	t = args->ptr[1].via.u64;
+
+	if (args->ptr[2].type != MSGPACK_OBJECT_POSITIVE_INTEGER)
+		return false;
+	b = args->ptr[2].via.u64;
+
+	if (args->ptr[3].type != MSGPACK_OBJECT_POSITIVE_INTEGER)
+		return false;
+	l = args->ptr[3].via.u64;
+
+	if (args->ptr[4].type != MSGPACK_OBJECT_POSITIVE_INTEGER)
+		return false;
+	r = args->ptr[4].via.u64;
+
+	if (args->ptr[5].type != MSGPACK_OBJECT_POSITIVE_INTEGER &&
+			args->ptr[5].type != MSGPACK_OBJECT_NEGATIVE_INTEGER)
+		return false;
+	rows = args->ptr[5].via.i64;
+
+	if (args->ptr[6].type != MSGPACK_OBJECT_POSITIVE_INTEGER)
+		return false;
+	cols = args->ptr[6].via.i64;
+
+/* this was reserved according to the documentation */
+	if (cols != 0){
+		trace("non-zero cols");
+	}
+
+/* scroll down */
+	size_t nr = b - t;
+	if (rows > 0){
+		for (size_t row = 0; row < nr; row++){
+			copy_row(grid, l, r, t + row + rows, t + row);
+		}
+	}
+
+	if (rows < 0){
+		rows = -rows;
+		for (size_t row = 0; row < nr; row++){
+			copy_row(grid, l, r, b - row - rows, b - row);
+		}
+	}
+
+	return true;
+}
+
 static bool grid_goto(const msgpack_object_array* arg)
 {
 	struct tui_context* grid = nvim_grid_to_tui(arg);
@@ -435,8 +510,6 @@ static bool highlight_attribute(const msgpack_object_array* arg)
  * undercurl: bool
  * blend: transparency 0-100 */
 		}
-
-		return true;
 	}
 
 	return true;
@@ -456,6 +529,7 @@ static const struct nvim_cmd redraw_cmds[] = {
 	{"grid_cursor_goto", grid_goto},
 	{"hl_attr_define", highlight_attribute},
 	{"default_colors_set", highlight_defcol},
+	{"grid_scroll", grid_scroll}
 /* option_set
  * set_scroll_region [top, bottom, left, right]
  * grid_scroll [id, top, bot, left, right, rows, cols] n rows direction, - down
@@ -485,14 +559,17 @@ static void nvim_redraw(const msgpack_object_array* arg)
 			continue;
 		const msgpack_object_array* iarg = &arg->ptr[i].via.array;
 
-		if (iarg->ptr[0].type != MSGPACK_OBJECT_STR)
+		if (iarg->ptr[0].type != MSGPACK_OBJECT_STR){
+			trace("bad arg");
 			continue;
+		}
 
 		const msgpack_object_str* str = &iarg->ptr[0].via.str;
 		bool found = false;
 		for (size_t j = 0; j < COUNT_OF(redraw_cmds); j++){
 			if (nvim_str_match(str, redraw_cmds[j].lbl)){
 				found = true;
+
 				if (!redraw_cmds[j].ptr(iarg)){
 					trace("parsing failed on redraw:%.*s", str->size, str->ptr);
 				}
@@ -528,17 +605,31 @@ static int mpack_to_nvim(void* data, const char* buf, unsigned long buf_out)
 
 static void* thread_input(void* data)
 {
-	int fdin = *(int*)data;
+	int* fdbuf = data;
+	int fdin = fdbuf[0];
+	int sigfd = fdbuf[1];
 
 	static msgpack_unpacker unpack;
 	msgpack_unpacker_init(&unpack, MSGPACK_UNPACKER_INIT_BUFFER_SIZE);
 
-/* doubt the buffering here is correct in the case where we don't get
- * a complete request, buffer_capacity increase */
-	for(;;){
-		ssize_t sz = msgpack_unpacker_buffer_capacity(&unpack);
-		void* buffer = msgpack_unpacker_buffer(&unpack);
+/* looking at the unpacked code, it seems to self- invoke destroy on
+ * unpacker_next calls, afact this should then release the zones from
+ * unpack */
+	msgpack_unpacked result;
+	msgpack_unpacked_init(&result);
 
+	for(;;){
+	/* make sure we can accomodate ~64k more, otherwise grow - since we are
+	 * running in RPC like mode we don't really know how much data there is
+	 * without parsing */
+		ssize_t sz = msgpack_unpacker_buffer_capacity(&unpack);
+		if (sz < 65536){
+			if (!msgpack_unpacker_reserve_buffer(&unpack, 65536))
+				break;
+			sz = msgpack_unpacker_buffer_capacity(&unpack);
+		}
+
+		void* buffer = msgpack_unpacker_buffer(&unpack);
 		ssize_t nr;
 		if (-1 == (nr = read(fdin, buffer, sz))){
 			if (errno == EAGAIN || errno == EINTR)
@@ -546,14 +637,15 @@ static void* thread_input(void* data)
 			break;
 		}
 
+/* pipe dead */
+		if (0 == nr)
+			break;
+
 		msgpack_unpacker_buffer_consumed(&unpack, nr);
 
-/* read as much as possible, see if we run into a continue */
-		msgpack_unpacked result;
-		msgpack_unpacked_init(&result);
-
 		int res;
-		while ((res = msgpack_unpacker_next(&unpack, &result))){
+		while (MSGPACK_UNPACK_SUCCESS ==
+			(res = msgpack_unpacker_next(&unpack, &result))){
 			const msgpack_object* const o = &result.data;
 			const msgpack_object_array* const args = &(o->via.array);
 			if (args->size != 3 && args->size != 4){
@@ -570,8 +662,11 @@ static void* thread_input(void* data)
  * careful with UAFs against de-allocated segments */
 			break;
 			case 2:
-/*			msgpack_object_print(stdout, *o);
-				fflush(stdout); */
+/*
+ * uncomment for quick debug
+ * msgpack_object_print(stdout, *o);
+ * fflush(stdout);
+ */
 				if (args->ptr[1].type == MSGPACK_OBJECT_STR &&
 						args->ptr[2].type == MSGPACK_OBJECT_ARRAY){
 					on_notification(&args->ptr[1].via.str, &args->ptr[2].via.array);
@@ -584,11 +679,13 @@ static void* thread_input(void* data)
 			break;
 			}
 		}
-
-		msgpack_unpacked_destroy(&result);
 	}
 
+/* release the ui thread */
 	close(fdin);
+	char cmd = 'q';
+	write(sigfd, &cmd, 1);
+
 	return NULL;
 }
 
@@ -736,11 +833,21 @@ int main(int argc, char** argv)
 	}
 
 	FILE* data_out;
-	int data_in;
-	if (!setup_nvim_process(argc-1, &argv[1], &data_in, &data_out)){
+
+	int data_in[2] = {-1, -1};
+
+	if (!setup_nvim_process(argc-1, &argv[1], &data_in[0], &data_out)){
 		arcan_tui_destroy(nvim.grids[0], "couldn't spawn neovim");
 		return EXIT_FAILURE;
 	}
+
+	int pipes[2];
+	if (-1 == pipe(pipes)){
+		arcan_tui_destroy(nvim.grids[0], "signal pipe allocation failure");
+		return EXIT_FAILURE;
+	}
+	data_in[1] = pipes[1];
+	int signalfd = pipes[0];
 
 	nvim.out = msgpack_packer_new(data_out, mpack_to_nvim);
 
@@ -752,14 +859,14 @@ int main(int argc, char** argv)
 	pthread_attr_init(&pthattr);
 	pthread_attr_setdetachstate(&pthattr, PTHREAD_CREATE_DETACHED);
 
-	if (-1 == pthread_create(&pth, &pthattr, thread_input, &data_in)){
+	if (-1 == pthread_create(&pth, &pthattr, thread_input, data_in)){
 		arcan_tui_destroy(nvim.grids[0], "input thread creation failed");
 		return EXIT_FAILURE;
 	}
 
 	while (1){
 		struct tui_process_res res =
-			arcan_tui_process(nvim.grids, nvim.n_grids, NULL, 0, -1);
+			arcan_tui_process(nvim.grids, nvim.n_grids, &signalfd, 1, -1);
 
 /* sweep the result bitmap and synch the grids that have changed */
 		if (res.errc == TUI_ERRC_OK){
@@ -768,6 +875,14 @@ int main(int argc, char** argv)
 		}
 		else
 			break;
+
+		if (res.ok){
+			char cmd;
+			if (read(signalfd, &cmd, 1) == 1){
+				if (cmd == 'q')
+					break;
+			}
+		}
 	}
 
 	for (size_t i = 0; i < nvim.n_grids; i++){
