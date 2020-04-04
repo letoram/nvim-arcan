@@ -2,10 +2,9 @@
  * TUI based UI frontend for NeoVIM
  * Missing / basic things:
  *  - default / background option attribute not set
- *  - mouse input forwarding
- *  - meta + input translation C-a etc.
  *  - clipboard action
  *  - setting title
+ *  - some scrolling bug flowing into the status-line
  *
  * - options to explore:
  *  - multiple grids
@@ -18,7 +17,7 @@
 #include <msgpack.h>
 #include <pthread.h>
 #include <errno.h>
-
+#include <ctype.h>
 #include "uthash.h"
 
 #ifndef COUNT_OF
@@ -44,6 +43,7 @@ static struct {
 
 struct nvim_meta {
 	int grid_id;
+	int button_mask;
 };
 
 #define TRACE_ENABLE
@@ -127,24 +127,162 @@ static bool on_alabel(struct tui_context* c, const char* label,
 	return false;
 }
 
+static void build_mouse_packet(
+	const char* button, const char* action,
+	const char* mod, int grid, int row, int col)
+{
+	size_t button_sz = strlen(button) + 1;
+	size_t action_sz = strlen(action) + 1;
+	size_t mod_sz = strlen(mod) + 1;
+	if (mod_sz == 1)
+		mod_sz = 0;
+
+	const char mouse_cmd[] = "nvim_input_mouse";
+	nvim_request_str(mouse_cmd, sizeof(mouse_cmd) - 1);
+	msgpack_pack_array(nvim.out, 6);
+	msgpack_pack_str(nvim.out, button_sz);
+	msgpack_pack_str_body(nvim.out, button, button_sz);
+	msgpack_pack_str(nvim.out, action_sz);
+	msgpack_pack_str_body(nvim.out, action, action_sz);
+	msgpack_pack_str(nvim.out, mod_sz);
+	msgpack_pack_str_body(nvim.out, mod, mod_sz);
+	msgpack_pack_int(nvim.out, grid);
+	msgpack_pack_int(nvim.out, row);
+	msgpack_pack_int(nvim.out, col);
+}
+
+static void on_mouse_button(struct tui_context* c,
+	int last_x, int last_y, int button, bool active, int modifiers, void* t)
+{
+	trace("mouse_btn(%d:%d, mods:%d, index: %d");
+	struct nvim_meta* m = t;
+
+/* don't consider release for wheel action */
+	if (!active && button >= TUIBTN_WHEEL_UP)
+		return;
+
+	const char* action, (* btn);
+
+	/* 1: {button} */
+	bool wheel = false;
+	switch(button){
+	case TUIBTN_LEFT:
+		btn = "left";
+	break;
+	case TUIBTN_RIGHT:
+		btn = "right";
+	break;
+	case TUIBTN_MIDDLE:
+		btn = "middle";
+	break;
+	case TUIBTN_WHEEL_UP:
+	case TUIBTN_WHEEL_DOWN:
+	default:
+		wheel = true;
+		btn = "wheel";
+	break;
+	}
+
+/* 2: {action} */
+	if (wheel){
+		if (button == TUIBTN_WHEEL_UP){
+			action = "up";
+		}
+		else {
+			action = "down";
+		}
+	}
+	else if (active){
+		action = "press";
+		m->button_mask |= 1 << TUIBTN_LEFT;
+	}
+	else {
+		m->button_mask &= ~(1 << TUIBTN_LEFT);
+		action = "release";
+	}
+
+/* modifier to button follows same rule as for normal input,
+ * i.e. C-A (though not as <Ca> */
+
+	build_mouse_packet(btn, action, "", m->grid_id, last_y, last_x);
+}
+
 static void on_mouse(struct tui_context* c,
 	bool relative, int x, int y, int modifiers, void* t)
 {
-	trace("mouse(%d:%d, mods:%d, rel: %d", x, y, modifiers, (int) relative);
-/* string:
- * nvim_input_mouse(button:left,right,middle,wheel, action:press,drag,ui,down,left,right,
- * modifier:CA - grid:number, row:number, col: number)
- * <%s%s>,<%u,%u>
- */
+	trace("mouse(%d:%d, mods:%d, rel: %d)", x, y, modifiers, (int) relative);
+	struct nvim_meta* m = t;
+	if (!m->button_mask || relative)
+		return;
+
+	const char* btn = "left";
+	if (TUIBTN_LEFT & m->button_mask)
+		btn = "left";
+	else if (TUIBTN_RIGHT & m->button_mask)
+		btn = "right";
+	else if (TUIBTN_MIDDLE & m->button_mask)
+		btn = "middle";
+	else
+		return;
+
+	printf("drag\n");
+	build_mouse_packet(btn, "drag", "", m->grid_id, y, x);
 }
 
-static void on_key(struct tui_context* c, uint32_t xkeysym,
+static void on_key(struct tui_context* c, uint32_t ksym,
 	uint8_t scancode, uint8_t mods, uint16_t subid, void* t)
 {
-	trace("unknown_key(%"PRIu32",%"PRIu8",%"PRIu16")", xkeysym, scancode, subid);
-/*
- * these need to be translated based on sym and mods
- */
+	trace("unknown_key(%"PRIu32",%"PRIu8",%"PRIu16")", ksym, scancode, subid);
+
+	char str[16];
+	size_t ofs = 0;
+
+	str[ofs++] = '<';
+
+	if (mods & (TUIM_LCTRL | TUIM_RCTRL)){
+		str[ofs++] = 'C';
+		str[ofs++] = '-';
+	}
+	if (mods & (TUIM_LALT | TUIM_RALT)){
+		str[ofs++] = 'A';
+		str[ofs++] = '-';
+	}
+	if (mods & (TUIM_LSHIFT | TUIM_RSHIFT)){
+		str[ofs++] = 'S';
+		str[ofs++] = '-';
+	}
+	if (mods & (TUIM_LMETA | TUIM_RMETA)){
+		str[ofs++] = 'M';
+		str[ofs++] = '-';
+	}
+
+
+/* is the keysym part of the visible set? then just add it like that */
+/* otherwise follow the special treatment for various things */
+	if (isprint(ksym)){
+		str[ofs++] = ksym;
+	}
+	else {
+		switch(ksym){
+		case TUIK_ESCAPE:
+			str[ofs++] = 'E';
+			str[ofs++] = 'S';
+			str[ofs++] = 'C';
+		break;
+		default:
+			printf("missing %d\n", ksym);
+			return;
+		}
+	}
+
+	str[ofs++] = '>';
+	const char cmd[] = "nvim_input";
+	nvim_request_str(cmd, sizeof(cmd) - 1);
+	msgpack_pack_array(nvim.out, 1);
+	msgpack_pack_str(nvim.out, ofs);
+	msgpack_pack_str_body(nvim.out, str, ofs);
+	str[ofs++] = 0;
+	printf("send input: %s\n", str);
 }
 
 static bool on_u8(struct tui_context* c, const char* u8, size_t len, void* t)
@@ -156,10 +294,16 @@ static bool on_u8(struct tui_context* c, const char* u8, size_t len, void* t)
 	const char cmd[] = "nvim_input";
 	nvim_request_str(cmd, sizeof(cmd) - 1);
 	msgpack_pack_array(nvim.out, 1);
-	msgpack_pack_str(nvim.out, len);
-	msgpack_pack_str_body(nvim.out, u8, len);
 
-/* nvim_put: lines[], tyoe[block, char, line], [after], [follow] */
+	if (*u8 == '<'){
+		msgpack_pack_str(nvim.out, 4);
+		msgpack_pack_str_body(nvim.out, "<LT>", 4);
+	}
+	else {
+		msgpack_pack_str(nvim.out, len);
+		msgpack_pack_str_body(nvim.out, u8, len);
+	}
+
 	return true;
 }
 
@@ -410,7 +554,7 @@ static bool grid_scroll(const msgpack_object_array* arg)
 
 	if (rows < 0){
 		rows = -rows;
-		for (size_t row = 0; row < nr; row++){
+		for (size_t row = 1; row < nr; row++){
 			copy_row(grid, l, r, b - row - rows, b - row);
 		}
 	}
@@ -660,6 +804,7 @@ static void* thread_input(void* data)
 				fprintf(stderr, "response\n");
 /* pair against pending requests from our side, see if some handler is registered,
  * careful with UAFs against de-allocated segments */
+
 			break;
 			case 2:
 /*
@@ -804,6 +949,7 @@ static struct tui_cbcfg setup_nvim(int id)
 		.input_label = on_label,
 		.input_alabel = on_alabel,
 		.input_mouse_motion = on_mouse,
+		.input_mouse_button = on_mouse_button,
 		.input_utf8 = on_u8,
 		.input_key = on_key,
 		.input_misc = on_misc,
@@ -826,6 +972,7 @@ int main(int argc, char** argv)
 	struct tui_cbcfg cbcfg = setup_nvim(1);
 	nvim.grids[0] = arcan_tui_setup(conn, NULL, &cbcfg, sizeof(cbcfg));
 	nvim.n_grids = 1;
+	arcan_tui_set_flags(nvim.grids[0], TUI_MOUSE_FULL);
 
 	if (!nvim.grids[0]){
 		fprintf(stderr, "failed to setup TUI connection\n");
