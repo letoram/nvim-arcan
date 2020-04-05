@@ -1,13 +1,19 @@
 /*
  * TUI based UI frontend for NeoVIM
+ *
  * Missing / basic things:
  *  - default / background option attribute not set
  *  - clipboard action
- *  - setting title
- *  - some scrolling bug flowing into the status-line
  *
  * - options to explore:
- *  - multiple grids
+ * - multiple grids
+ *
+ * - external popups:
+ *   - option: ext_popupmenu
+ *   - notifications: popupmenu_show (items, selected, row, col, grid)
+ *                    items : array (word, kind, menu, info)
+ *                    - probe availability by first trying to get a subwindow
+ *
  */
 #include <arcan_shmif.h>
 #include <arcan_tui.h>
@@ -27,6 +33,7 @@
 
 struct hl_state {
 	struct tui_screen_attr attr;
+	bool got_fg, got_bg;
 	uint64_t id;
 	UT_hash_handle hh;
 };
@@ -34,19 +41,47 @@ struct hl_state {
 static struct hl_state* highlights;
 
 static struct {
-/* mutex around packer out */
+/*
+ * multiple grids will be dealt with in a serial manner through _process,
+ * which means that [out] should not need a mutex for protection - but
+ * there is a 'near' impossible edge where multiple contexts gets
+ * multipart paste operations, though that would require some disturbing
+ * behavior on the WM side */
 	msgpack_packer* out;
 	uint32_t reqid;
+
 	struct tui_context* grids[32];
 	size_t n_grids;
-} nvim;
+
+/* need to track which, if any, grid is in multipart- paste state */
+	ssize_t paste_lock;
+
+/*
+ * used for synching - there is an input thread for data coming from nvim
+ * and a render thread for processing each active context. If there is input
+ * that causes tui_writes while it is in a processing state, there is the
+ * possibility of race condition causing cell contents to go out of synch
+ *
+ * due to the io-multiplex nature, we go with a synch-fd for waking up
+ * and two mutexes to get the cvar-producer-consumer setup going - sigfd
+ * accepts 'q' (quit) and 'l' (lock), synch guards the context and hold
+ * keeps the main thread from starving lock on synch.
+ */
+	pthread_mutex_t synch;
+	pthread_mutex_t hold;
+	int sigfd;
+} nvim = {
+	.synch = PTHREAD_MUTEX_INITIALIZER,
+	.hold = PTHREAD_MUTEX_INITIALIZER,
+	.paste_lock = -1
+};
 
 struct nvim_meta {
 	int grid_id;
 	int button_mask;
 };
 
-#define TRACE_ENABLE
+#undef TRACE_ENABLE
 static inline void trace(const char* msg, ...)
 {
 #ifdef TRACE_ENABLE
@@ -112,6 +147,21 @@ static bool query_label(struct tui_context* ctx,
 		lang ? lang : "unknown(language)");
 
 	return false;
+}
+
+static void update_cval(uint64_t val, uint8_t rgb[static 3])
+{
+	if ((uint64_t)-1 == val){
+		struct tui_screen_attr attr = arcan_tui_defattr(nvim.grids[0], NULL);
+		rgb[0] = attr.fc[0];
+		rgb[1] = attr.fc[1];
+		rgb[2] = attr.fc[2];
+	}
+	else {
+		rgb[2] = (val & 0x000000ff);
+		rgb[1] = (val & 0x0000ff00) >>  8;
+		rgb[0] = (val & 0x00ff0000) >> 16;
+	}
 }
 
 static bool on_label(struct tui_context* c, const char* label, bool act, void* t)
@@ -210,7 +260,6 @@ static void on_mouse_button(struct tui_context* c,
 static void on_mouse(struct tui_context* c,
 	bool relative, int x, int y, int modifiers, void* t)
 {
-	trace("mouse(%d:%d, mods:%d, rel: %d)", x, y, modifiers, (int) relative);
 	struct nvim_meta* m = t;
 	if (!m->button_mask || relative)
 		return;
@@ -225,7 +274,6 @@ static void on_mouse(struct tui_context* c,
 	else
 		return;
 
-	printf("drag\n");
 	build_mouse_packet(btn, "drag", "", m->grid_id, y, x);
 }
 
@@ -270,7 +318,7 @@ static void on_key(struct tui_context* c, uint32_t ksym,
 			str[ofs++] = 'C';
 		break;
 		default:
-			printf("missing %d\n", ksym);
+			printf("missing key %d\n", ksym);
 			return;
 		}
 	}
@@ -282,7 +330,6 @@ static void on_key(struct tui_context* c, uint32_t ksym,
 	msgpack_pack_str(nvim.out, ofs);
 	msgpack_pack_str_body(nvim.out, str, ofs);
 	str[ofs++] = 0;
-	printf("send input: %s\n", str);
 }
 
 static bool on_u8(struct tui_context* c, const char* u8, size_t len, void* t)
@@ -345,6 +392,49 @@ static void on_utf8_paste(struct tui_context* c,
 	const uint8_t* str, size_t len, bool cont, void* t)
 {
 	trace("utf8-paste(%s):%d", str, (int) cont);
+	/* nvim_paste(data, cont ? phase == -1 single, 1: first, 2: cont, 3: end */
+	const char cmd[] = "nvim_paste";
+	struct nvim_meta* nvim_grid = t;
+
+/*
+ * -1 : single
+ *  1 : first in multipart
+ *  2 : part in multipart
+ *  3 : end of multipart
+ */
+	int mode = -1;
+
+	if (-1 == nvim.paste_lock){
+		if (cont){
+			mode = 1;
+			nvim.paste_lock = nvim_grid->grid_id;
+		}
+	}
+
+/* ignore the paste, already busy here - if it becomes a problem, possibly
+ * dup and queue - the thing is that paste does not carry a grid id so screwed
+ * anyhow without modifying nvim */
+	else if (nvim.paste_lock != nvim_grid->grid_id){
+		return;
+	}
+	else {
+		if (cont){
+			mode = 2;
+		}
+		else {
+			mode = 3;
+			nvim.paste_lock = -1;
+		}
+	}
+
+	nvim_request_str(cmd, sizeof(cmd) - 1);
+
+	msgpack_pack_array(nvim.out, 3);
+	msgpack_pack_str(nvim.out, len);
+	msgpack_pack_str_body(nvim.out, str, len);
+/* should possibly expose as a label to get controls for CR/LF, CRLF, LF */
+	msgpack_pack_int(nvim.out, true);
+	msgpack_pack_int(nvim.out, mode);
 }
 
 static void on_resize(struct tui_context* c,
@@ -399,7 +489,8 @@ static bool draw_line(int gid,
  * 3 items : [ch, hlid, repeat]
  *
  * if hlid is not set, grab the last defined one - global */
-	struct tui_screen_attr attr = arcan_tui_defattr(grid, NULL);
+	struct tui_screen_attr defattr = arcan_tui_defattr(grid, NULL);
+	struct tui_screen_attr cattr = defattr;
 
 	for (size_t i = 0; i < line->size; i++){
 		if (line->ptr[i].type != MSGPACK_OBJECT_ARRAY)
@@ -414,11 +505,14 @@ static bool draw_line(int gid,
 			struct hl_state* hl;
 			HASH_FIND_INT(highlights, &cell->ptr[1].via.u64, hl);
 			if (hl){
-				attr = hl->attr;
+				cattr = hl->attr;
+				if (!hl->got_fg)
+					memcpy(cattr.fc, defattr.fc, 3);
+				if (!hl->got_bg)
+					memcpy(cattr.bc, defattr.bc, 3);
 			}
-			else{
-				printf("missing hl: %"PRIu64"\n", cell->ptr[1].via.u64);
-				attr = arcan_tui_defattr(grid, NULL);
+			else {
+				cattr = defattr;
 			}
 		}
 
@@ -428,7 +522,7 @@ static bool draw_line(int gid,
 		for (size_t i = 0; i < count; i++)
 			arcan_tui_writeu8(grid,
 				(uint8_t*) cell->ptr[0].via.str.ptr,
-				cell->ptr[0].via.str.size, &attr
+				cell->ptr[0].via.str.size, &cattr
 			);
 	}
 	return true;
@@ -438,7 +532,6 @@ static bool draw_lines(const msgpack_object_array* arg)
 {
 /* arg is array with command as first element,
  * all other elements are arrays representing a line */
-
 	for (size_t line = 1; line < arg->size; line++){
 		if (arg->ptr[line].type != MSGPACK_OBJECT_ARRAY)
 			continue;
@@ -584,21 +677,6 @@ static bool grid_goto(const msgpack_object_array* arg)
 	return true;
 }
 
-static void update_cval(uint64_t val, uint8_t rgb[static 3])
-{
-	if ((uint64_t)-1 == val){
-		struct tui_screen_attr attr = arcan_tui_defattr(nvim.grids[0], NULL);
-		rgb[0] = attr.fc[0];
-		rgb[1] = attr.fc[1];
-		rgb[2] = attr.fc[2];
-	}
-	else {
-		rgb[2] = (val & 0x000000ff);
-		rgb[1] = (val & 0x0000ff00) >>  8;
-		rgb[0] = (val & 0x00ff0000) >> 16;
-	}
-}
-
 static bool highlight_attribute(const msgpack_object_array* arg)
 {
 	for (size_t i = 1; i < arg->size; i++){
@@ -610,10 +688,12 @@ static bool highlight_attribute(const msgpack_object_array* arg)
 		HASH_FIND_INT(highlights, &attrid, state);
 		if (!state){
 			state = malloc(sizeof(struct hl_state));
-			state->attr = arcan_tui_defattr(nvim.grids[0], NULL);
 			state->id = attrid;
 			HASH_ADD_INT(highlights, id, state);
 		}
+		state->attr = arcan_tui_defattr(nvim.grids[0], NULL);
+		state->got_fg = false;
+		state->got_bg = false;
 
 /* should be size [4],
  * id (u64), rgb (use this), cterm (ignore this), info (use this) */
@@ -629,6 +709,7 @@ static bool highlight_attribute(const msgpack_object_array* arg)
 
 /* foreground or background? */
 		const msgpack_object_map* cm = &ci->ptr[1].via.map;
+
 		for (size_t j = 0; j < cm->size; j++){
 			if (cm->ptr[j].key.type != MSGPACK_OBJECT_STR ||
 					cm->ptr[j].val.type != MSGPACK_OBJECT_POSITIVE_INTEGER)
@@ -637,22 +718,33 @@ static bool highlight_attribute(const msgpack_object_array* arg)
 			if (nvim_str_match(&cm->ptr[j].key.via.str, "foreground")){
 				uint64_t val = cm->ptr[j].val.via.u64;
 				update_cval(val, state->attr.fc);
+				state->got_fg = true;
 			}
 			else if (nvim_str_match(&cm->ptr[j].key.via.str, "background")){
 				uint64_t val = cm->ptr[j].val.via.u64;
 				update_cval(val, state->attr.bc);
+				state->got_bg = true;
 			}
-			else
-				msgpack_object_print(stderr, cm->ptr[j].key);
-/*
- * special:
- * reverse: (color on underline / undercurl)
- * italic: bool
- * bold: bool
- * strikethrough: bool
- * underline: bool
- * undercurl: bool
- * blend: transparency 0-100 */
+			else if (nvim_str_match(&cm->ptr[j].key.via.str, "reverse")){
+				state->attr.inverse = true;
+			}
+			else if (nvim_str_match(&cm->ptr[j].key.via.str, "bold")){
+				state->attr.bold = true;
+			}
+			else if (nvim_str_match(&cm->ptr[j].key.via.str, "underline")){
+				state->attr.underline = true;
+			}
+			else if (nvim_str_match(&cm->ptr[j].key.via.str, "italic")){
+				state->attr.italic = true;
+			}
+			else if (nvim_str_match(&cm->ptr[j].key.via.str, "strikethrough")){
+				state->attr.strikethrough = true;
+			}
+/* Special: can't be done atm, lacks a way to express it in TUI */
+/* Undercurl: missing attribute in TUI, possible but we are out of bits */
+/* Blend: could be done but so far used only for all backgrounds regardless */
+			else {
+			}
 		}
 	}
 
@@ -662,6 +754,88 @@ static bool highlight_attribute(const msgpack_object_array* arg)
 static bool highlight_defcol(const msgpack_object_array* arg)
 {
 /*default colors: rgb_fg, rgb_bg, rgb_sp, cterm_fg, cterm_bg */
+	if (arg->ptr[1].type != MSGPACK_OBJECT_ARRAY)
+		return false;
+
+	uint64_t fgc = arg->ptr[1].via.array.ptr[0].via.u64;
+	uint64_t bgc = arg->ptr[1].via.array.ptr[1].via.u64;
+	struct hl_state* state;
+	uint64_t id = 0;
+
+	HASH_FIND_INT(highlights, &id, state);
+	if (!state){
+		state = malloc(sizeof(struct hl_state));
+		state->attr = arcan_tui_defattr(nvim.grids[0], NULL);
+		state->id = 0;
+		HASH_ADD_INT(highlights, id, state);
+	}
+
+	struct tui_screen_attr attr = {
+	};
+	update_cval(fgc, attr.fc);
+	update_cval(bgc, attr.bc);
+	update_cval(fgc, state->attr.fc);
+	update_cval(bgc, state->attr.bc);
+
+	for (size_t i = 0; i < COUNT_OF(nvim.grids); i++){
+		if (!nvim.grids[i])
+			continue;
+
+		arcan_tui_set_color(nvim.grids[i], TUI_COL_PRIMARY, attr.fc);
+		arcan_tui_set_bgcolor(nvim.grids[i], TUI_COL_PRIMARY, attr.bc);
+
+		arcan_tui_set_color(nvim.grids[i], TUI_COL_TEXT, attr.fc);
+		arcan_tui_set_bgcolor(nvim.grids[i], TUI_COL_TEXT, attr.bc);
+
+		arcan_tui_set_bgcolor(nvim.grids[i], TUI_COL_BG, attr.bc);
+		arcan_tui_set_color(nvim.grids[i], TUI_COL_BG, attr.bc);
+		arcan_tui_defattr(nvim.grids[i], &attr);
+	}
+
+	return true;
+}
+
+static bool option_set(const msgpack_object_array* arg)
+{
+/* any options we really need? */
+	return true;
+}
+
+static bool set_icon(const msgpack_object_array* arg)
+{
+/* IDENT doesn't really have an iconified summary
+ * (except icons which isn't the same at all)  */
+	return true;
+}
+
+static bool set_title(const msgpack_object_array* arg)
+{
+	const msgpack_object_array* gargs = &arg->ptr[1].via.array;
+	if (gargs->size != 1 || gargs->ptr[0].type != MSGPACK_OBJECT_STR)
+		return false;
+
+	msgpack_object_str str = gargs[0].ptr[0].via.str;
+	if (str.size == 0){
+		arcan_tui_ident(nvim.grids[0], "");
+	}
+	else {
+		char* buf = malloc(str.size + 1);
+		if (!buf)
+			return true;
+		memcpy(buf, str.ptr, str.size);
+		buf[str.size] = 0;
+		arcan_tui_ident(nvim.grids[0], buf);
+		free(buf);
+	}
+
+	return true;
+}
+
+static bool release_locks(const msgpack_object_array* arg)
+{
+/* question is if we really should hold the locks and go release here or not,
+ * not seeing any weird behavior from keeping it on the UI calls so wait and
+ * see */
 	return true;
 }
 
@@ -673,16 +847,17 @@ static const struct nvim_cmd redraw_cmds[] = {
 	{"grid_cursor_goto", grid_goto},
 	{"hl_attr_define", highlight_attribute},
 	{"default_colors_set", highlight_defcol},
-	{"grid_scroll", grid_scroll}
+	{"grid_scroll", grid_scroll},
+	{"option_set", option_set},
+	{"set_icon", set_icon},
+	{"set_title", set_title},
+	{"flush", release_locks}
 /* option_set
  * set_scroll_region [top, bottom, left, right]
  * grid_scroll [id, top, bot, left, right, rows, cols] n rows direction, - down
  * default_colors_set
- * hl_attr_define
  * hl_group_set
  * grid_clear
- * set_icon (minimized title)
- * set_titl (normal title)
  * mode_info_set (cursor-shape, cursor-size
  * mode_change
  * flush [release mutex / allow refresh ]
@@ -731,7 +906,24 @@ static void nvim_redraw(const msgpack_object_array* arg)
 static void on_notification(msgpack_object_str* cmd, const msgpack_object_array* arg)
 {
 	if (nvim_str_match(cmd, "redraw")){
+		bool got_hold = false;
+
+/* first try without the slowpath, if it can't be done, send the wakeup
+ * command to break out of poll, and then the render thread will stick to
+ * the hold- lock, process the command and then release all held locks */
+		if (0 != pthread_mutex_trylock(&nvim.synch)){
+			pthread_mutex_lock(&nvim.hold);
+			got_hold = true;
+			char cmd = 'l';
+			write(nvim.sigfd, &cmd, 1);
+			pthread_mutex_lock(&nvim.synch);
+		}
+
 		nvim_redraw(arg);
+		pthread_mutex_unlock(&nvim.synch);
+		if (got_hold){
+			pthread_mutex_unlock(&nvim.hold);
+		}
 	}
 /* win-close, win-hide : find grid, close it (unless primary) */
 	else{
@@ -751,7 +943,6 @@ static void* thread_input(void* data)
 {
 	int* fdbuf = data;
 	int fdin = fdbuf[0];
-	int sigfd = fdbuf[1];
 
 	static msgpack_unpacker unpack;
 	msgpack_unpacker_init(&unpack, MSGPACK_UNPACKER_INIT_BUFFER_SIZE);
@@ -798,13 +989,10 @@ static void* thread_input(void* data)
 			}
 			switch(args->ptr[0].via.u64){
 			case 0:
-				fprintf(stderr, "request\n");
+				trace("request");
 			break;
 			case 1:
-				fprintf(stderr, "response\n");
-/* pair against pending requests from our side, see if some handler is registered,
- * careful with UAFs against de-allocated segments */
-
+				trace("response");
 			break;
 			case 2:
 /*
@@ -812,7 +1000,7 @@ static void* thread_input(void* data)
  * msgpack_object_print(stdout, *o);
  * fflush(stdout);
  */
-				if (args->ptr[1].type == MSGPACK_OBJECT_STR &&
+ 			if (args->ptr[1].type == MSGPACK_OBJECT_STR &&
 						args->ptr[2].type == MSGPACK_OBJECT_ARRAY){
 					on_notification(&args->ptr[1].via.str, &args->ptr[2].via.array);
 				}
@@ -829,7 +1017,7 @@ static void* thread_input(void* data)
 /* release the ui thread */
 	close(fdin);
 	char cmd = 'q';
-	write(sigfd, &cmd, 1);
+	write(nvim.sigfd, &cmd, 1);
 
 	return NULL;
 }
@@ -968,7 +1156,7 @@ static struct tui_cbcfg setup_nvim(int id)
 
 int main(int argc, char** argv)
 {
-	arcan_tui_conn* conn = arcan_tui_open_display("tui-test", "");
+	arcan_tui_conn* conn = arcan_tui_open_display("NeoVim", "");
 	struct tui_cbcfg cbcfg = setup_nvim(1);
 	nvim.grids[0] = arcan_tui_setup(conn, NULL, &cbcfg, sizeof(cbcfg));
 	nvim.n_grids = 1;
@@ -981,7 +1169,7 @@ int main(int argc, char** argv)
 
 	FILE* data_out;
 
-	int data_in[2] = {-1, -1};
+	int data_in[2] = {-1};
 
 	if (!setup_nvim_process(argc-1, &argv[1], &data_in[0], &data_out)){
 		arcan_tui_destroy(nvim.grids[0], "couldn't spawn neovim");
@@ -993,7 +1181,7 @@ int main(int argc, char** argv)
 		arcan_tui_destroy(nvim.grids[0], "signal pipe allocation failure");
 		return EXIT_FAILURE;
 	}
-	data_in[1] = pipes[1];
+	nvim.sigfd = pipes[1];
 	int signalfd = pipes[0];
 
 	nvim.out = msgpack_packer_new(data_out, mpack_to_nvim);
@@ -1012,8 +1200,10 @@ int main(int argc, char** argv)
 	}
 
 	while (1){
+		pthread_mutex_lock(&nvim.synch);
 		struct tui_process_res res =
 			arcan_tui_process(nvim.grids, nvim.n_grids, &signalfd, 1, -1);
+		pthread_mutex_unlock(&nvim.synch);
 
 /* sweep the result bitmap and synch the grids that have changed */
 		if (res.errc == TUI_ERRC_OK){
@@ -1028,6 +1218,10 @@ int main(int argc, char** argv)
 			if (read(signalfd, &cmd, 1) == 1){
 				if (cmd == 'q')
 					break;
+				else if (cmd == 'l'){
+					pthread_mutex_lock(&nvim.hold);
+					pthread_mutex_unlock(&nvim.hold);
+				}
 			}
 		}
 	}
