@@ -312,13 +312,64 @@ static void on_key(struct tui_context* c, uint32_t ksym,
 	}
 	else {
 		switch(ksym){
+		case TUIK_F1:
+			str[ofs++] = 'F';
+			str[ofs++] = '1';
+		break;
+		case TUIK_F2:
+			str[ofs++] = 'F';
+			str[ofs++] = '2';
+		break;
+		case TUIK_F3:
+			str[ofs++] = 'F';
+			str[ofs++] = '3';
+		break;
+		case TUIK_F4:
+			str[ofs++] = 'F';
+			str[ofs++] = '4';
+		break;
+		case TUIK_F5:
+			str[ofs++] = 'F';
+			str[ofs++] = '5';
+		break;
+		case TUIK_F6:
+			str[ofs++] = 'F';
+			str[ofs++] = '6';
+		break;
+		case TUIK_F7:
+			str[ofs++] = 'F';
+			str[ofs++] = '7';
+		break;
+		case TUIK_F8:
+			str[ofs++] = 'F';
+			str[ofs++] = '8';
+		break;
+		case TUIK_F9:
+			str[ofs++] = 'F';
+			str[ofs++] = '9';
+		break;
+		case TUIK_F10:
+			str[ofs++] = 'F';
+			str[ofs++] = '1';
+			str[ofs++] = '0';
+		break;
+		case TUIK_F11:
+			str[ofs++] = 'F';
+			str[ofs++] = '1';
+			str[ofs++] = '1';
+		break;
+		case TUIK_F12:
+			str[ofs++] = 'F';
+			str[ofs++] = '1';
+			str[ofs++] = '2';
+		break;
 		case TUIK_ESCAPE:
 			str[ofs++] = 'E';
 			str[ofs++] = 'S';
 			str[ofs++] = 'C';
 		break;
 		default:
-			printf("missing key %d\n", ksym);
+			fprintf(stderr, "missing key %d\n", ksym);
 			return;
 		}
 	}
@@ -711,8 +762,7 @@ static bool highlight_attribute(const msgpack_object_array* arg)
 		const msgpack_object_map* cm = &ci->ptr[1].via.map;
 
 		for (size_t j = 0; j < cm->size; j++){
-			if (cm->ptr[j].key.type != MSGPACK_OBJECT_STR ||
-					cm->ptr[j].val.type != MSGPACK_OBJECT_POSITIVE_INTEGER)
+			if (cm->ptr[j].key.type != MSGPACK_OBJECT_STR)
 				continue;
 
 			if (nvim_str_match(&cm->ptr[j].key.via.str, "foreground")){
@@ -727,6 +777,8 @@ static bool highlight_attribute(const msgpack_object_array* arg)
 			}
 			else if (nvim_str_match(&cm->ptr[j].key.via.str, "reverse")){
 				state->attr.inverse = true;
+				printf("got inverse\n");
+				fflush(stdout);
 			}
 			else if (nvim_str_match(&cm->ptr[j].key.via.str, "bold")){
 				state->attr.bold = true;
@@ -996,10 +1048,9 @@ static void* thread_input(void* data)
 			break;
 			case 2:
 /*
- * uncomment for quick debug
  * msgpack_object_print(stdout, *o);
  * fflush(stdout);
- */
+ * uncomment for quick debug */
  			if (args->ptr[1].type == MSGPACK_OBJECT_STR &&
 						args->ptr[2].type == MSGPACK_OBJECT_ARRAY){
 					on_notification(&args->ptr[1].via.str, &args->ptr[2].via.array);
@@ -1220,6 +1271,7 @@ int main(int argc, char** argv)
 					break;
 				else if (cmd == 'l'){
 					pthread_mutex_lock(&nvim.hold);
+					trace("synch");
 					pthread_mutex_unlock(&nvim.hold);
 				}
 			}
