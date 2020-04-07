@@ -22,6 +22,7 @@
 #include <errno.h>
 #include <msgpack.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <errno.h>
 #include <ctype.h>
 #include "uthash.h"
@@ -70,6 +71,7 @@ static struct {
 	pthread_mutex_t synch;
 	pthread_mutex_t hold;
 	int sigfd;
+	int lock_level;
 } nvim = {
 	.synch = PTHREAD_MUTEX_INITIALIZER,
 	.hold = PTHREAD_MUTEX_INITIALIZER,
@@ -77,6 +79,7 @@ static struct {
 };
 
 struct nvim_meta {
+	int cx, cy;
 	int grid_id;
 	int button_mask;
 };
@@ -532,6 +535,9 @@ static bool draw_line(int gid,
 	unsigned row, unsigned offset, const msgpack_object_array* line)
 {
 	struct tui_context* grid = nvim.grids[0];
+	struct tui_cbcfg cbcfg;
+	arcan_tui_update_handlers(grid, NULL, &cbcfg, sizeof(cbcfg));
+	struct nvim_meta* grid_meta = cbcfg.tag;
 	arcan_tui_move_to(grid, offset, row);
 
 /* format depends on individual line size:
@@ -542,6 +548,7 @@ static bool draw_line(int gid,
  * if hlid is not set, grab the last defined one - global */
 	struct tui_screen_attr defattr = arcan_tui_defattr(grid, NULL);
 	struct tui_screen_attr cattr = defattr;
+	struct hl_state* hl = NULL;
 
 	for (size_t i = 0; i < line->size; i++){
 		if (line->ptr[i].type != MSGPACK_OBJECT_ARRAY)
@@ -551,22 +558,25 @@ static bool draw_line(int gid,
 		if (cell->ptr[0].type != MSGPACK_OBJECT_STR)
 			return false;
 
-		size_t count = 1;
 		if (cell->size > 1){
-			struct hl_state* hl;
-			HASH_FIND_INT(highlights, &cell->ptr[1].via.u64, hl);
-			if (hl){
-				cattr = hl->attr;
-				if (!hl->got_fg)
-					memcpy(cattr.fc, defattr.fc, 3);
-				if (!hl->got_bg)
-					memcpy(cattr.bc, defattr.bc, 3);
-			}
-			else {
-				cattr = defattr;
-			}
+			struct hl_state* new;
+			HASH_FIND_INT(highlights, &cell->ptr[1].via.u64, new);
+			if (new)
+				hl = new;
 		}
 
+		if (hl){
+			cattr = hl->attr;
+			if (!hl->got_fg)
+				memcpy(cattr.fc, defattr.fc, 3);
+			if (!hl->got_bg)
+				memcpy(cattr.bc, defattr.bc, 3);
+		}
+		else {
+			trace("missing highlight attribute");
+		}
+
+		size_t count = 1;
 		if (cell->size == 3)
 			count = cell->ptr[2].via.u64;
 
@@ -576,6 +586,10 @@ static bool draw_line(int gid,
 				cell->ptr[0].via.str.size, &cattr
 			);
 	}
+
+/* restore known cursor position, not doing this caused the
+ * cursor to sometimes look like it was stuck at end of line */
+	arcan_tui_move_to(grid, grid_meta->cx, grid_meta->cy);
 	return true;
 }
 
@@ -709,6 +723,10 @@ static bool grid_scroll(const msgpack_object_array* arg)
 static bool grid_goto(const msgpack_object_array* arg)
 {
 	struct tui_context* grid = nvim_grid_to_tui(arg);
+	struct tui_cbcfg cbcfg;
+	arcan_tui_update_handlers(grid, NULL, &cbcfg, sizeof(cbcfg));
+	struct nvim_meta* grid_meta = cbcfg.tag;
+
 /* can now assume [cmd, [gid, ...] structure */
 
 	const msgpack_object_array* gargs = &arg->ptr[1].via.array;
@@ -723,8 +741,9 @@ static bool grid_goto(const msgpack_object_array* arg)
 		return false;
 	uint64_t col = gargs->ptr[2].via.u64;
 
+	grid_meta->cx = col;
+	grid_meta->cy = row;
 	arcan_tui_move_to(grid, col, row);
-
 	return true;
 }
 
@@ -777,8 +796,6 @@ static bool highlight_attribute(const msgpack_object_array* arg)
 			}
 			else if (nvim_str_match(&cm->ptr[j].key.via.str, "reverse")){
 				state->attr.inverse = true;
-				printf("got inverse\n");
-				fflush(stdout);
 			}
 			else if (nvim_str_match(&cm->ptr[j].key.via.str, "bold")){
 				state->attr.bold = true;
@@ -885,9 +902,21 @@ static bool set_title(const msgpack_object_array* arg)
 
 static bool release_locks(const msgpack_object_array* arg)
 {
-/* question is if we really should hold the locks and go release here or not,
- * not seeing any weird behavior from keeping it on the UI calls so wait and
- * see */
+/* this is a bit problematic in the sense that we may well get multiple redraw
+ * calls on one frame, so the synch() is needed to align against the refresh,
+ * but that lowers the responsiveness for resize etc. only real workaround for
+ * that is to have an intermediate buffer for the grid - skipping that for the
+ * time being */
+	if (!nvim.lock_level)
+		return false;
+
+	pthread_mutex_unlock(&nvim.synch);
+	if (nvim.lock_level == 2){
+		pthread_mutex_unlock(&nvim.hold);
+	}
+
+	nvim.lock_level = 0;
+
 	return true;
 }
 
@@ -958,24 +987,23 @@ static void nvim_redraw(const msgpack_object_array* arg)
 static void on_notification(msgpack_object_str* cmd, const msgpack_object_array* arg)
 {
 	if (nvim_str_match(cmd, "redraw")){
-		bool got_hold = false;
 
 /* first try without the slowpath, if it can't be done, send the wakeup
  * command to break out of poll, and then the render thread will stick to
  * the hold- lock, process the command and then release all held locks */
-		if (0 != pthread_mutex_trylock(&nvim.synch)){
-			pthread_mutex_lock(&nvim.hold);
-			got_hold = true;
-			char cmd = 'l';
-			write(nvim.sigfd, &cmd, 1);
-			pthread_mutex_lock(&nvim.synch);
+		if (!nvim.lock_level){
+			nvim.lock_level = 1;
+
+			if (0 != pthread_mutex_trylock(&nvim.synch)){
+				pthread_mutex_lock(&nvim.hold);
+				nvim.lock_level = 2;
+				char cmd = 'l';
+				write(nvim.sigfd, &cmd, 1);
+				pthread_mutex_lock(&nvim.synch);
+			}
 		}
 
 		nvim_redraw(arg);
-		pthread_mutex_unlock(&nvim.synch);
-		if (got_hold){
-			pthread_mutex_unlock(&nvim.hold);
-		}
 	}
 /* win-close, win-hide : find grid, close it (unless primary) */
 	else{
@@ -1035,7 +1063,17 @@ static void* thread_input(void* data)
 			(res = msgpack_unpacker_next(&unpack, &result))){
 			const msgpack_object* const o = &result.data;
 			const msgpack_object_array* const args = &(o->via.array);
-			if (args->size != 3 && args->size != 4){
+
+#ifdef TRACE_ENABLED
+#define DETAILED_TRACE
+#ifdef DETAILED_TRACE
+msgpack_object_print(stderr, *o);
+fputs("\n", stderr);
+fflush(stderr);
+#endif
+#endif
+
+ 			if (args->size != 3 && args->size != 4){
 				fprintf(stderr, "invalid object size");
 				continue;
 			}
@@ -1047,10 +1085,6 @@ static void* thread_input(void* data)
 				trace("response");
 			break;
 			case 2:
-/*
- * msgpack_object_print(stdout, *o);
- * fflush(stdout);
- * uncomment for quick debug */
  			if (args->ptr[1].type == MSGPACK_OBJECT_STR &&
 						args->ptr[2].type == MSGPACK_OBJECT_ARRAY){
 					on_notification(&args->ptr[1].via.str, &args->ptr[2].via.array);
@@ -1254,7 +1288,6 @@ int main(int argc, char** argv)
 		pthread_mutex_lock(&nvim.synch);
 		struct tui_process_res res =
 			arcan_tui_process(nvim.grids, nvim.n_grids, &signalfd, 1, -1);
-		pthread_mutex_unlock(&nvim.synch);
 
 /* sweep the result bitmap and synch the grids that have changed */
 		if (res.errc == TUI_ERRC_OK){
@@ -1263,6 +1296,8 @@ int main(int argc, char** argv)
 		}
 		else
 			break;
+
+		pthread_mutex_unlock(&nvim.synch);
 
 		if (res.ok){
 			char cmd;
