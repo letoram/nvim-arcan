@@ -54,6 +54,16 @@ static struct {
 	struct tui_context* grids[32];
 	size_t n_grids;
 
+/* multigrid feature requires much more WM integration - safer to have
+ * that as an opt-in rather than default */
+	bool multigrid;
+
+/* externalized popups */
+	bool popups;
+
+/* externalize input prompt */
+	bool messages;
+
 /* need to track which, if any, grid is in multipart- paste state */
 	ssize_t paste_lock;
 
@@ -72,6 +82,8 @@ static struct {
 	pthread_mutex_t hold;
 	int sigfd;
 	int lock_level;
+
+	FILE* trace_out;
 } nvim = {
 	.synch = PTHREAD_MUTEX_INITIALIZER,
 	.hold = PTHREAD_MUTEX_INITIALIZER,
@@ -84,28 +96,29 @@ struct nvim_meta {
 	int button_mask;
 };
 
-#undef TRACE_ENABLE
 static inline void trace(const char* msg, ...)
 {
-#ifdef TRACE_ENABLE
+	if (!nvim.trace_out)
+		return;
+
 	va_list args;
 	va_start( args, msg );
-		vfprintf(stderr,  msg, args );
+		vfprintf(nvim.trace_out,  msg, args );
 	va_end( args);
-	fputs("\n", stderr);
-#endif
+	fputs("\n", nvim.trace_out);
 }
 
 static void trace_obj_array(const msgpack_object_array* arg)
 {
-#ifdef TRACE_ENABLE
+	if (!nvim.trace_out)
+		return;
+
 	struct msgpack_object obj = {
 		.type = MSGPACK_OBJECT_ARRAY,
 		.via.array = *arg
 	};
-	msgpack_object_print(stderr, obj);
-	fprintf(stderr, "\n");
-#endif
+	msgpack_object_print(nvim.trace_out, obj);
+	fprintf(nvim.trace_out, "\n");
 }
 
 static uint32_t nvim_request_str(const char* str, size_t sz)
@@ -170,7 +183,7 @@ static void update_cval(uint64_t val, uint8_t rgb[static 3])
 static bool on_label(struct tui_context* c, const char* label, bool act, void* t)
 {
 	trace("label(%s)", label);
-	return true;
+	return false;
 }
 
 static bool on_alabel(struct tui_context* c, const char* label,
@@ -371,9 +384,74 @@ static void on_key(struct tui_context* c, uint32_t ksym,
 			str[ofs++] = 'S';
 			str[ofs++] = 'C';
 		break;
+		case TUIK_LEFT:
+			str[ofs++] = 'L';
+			str[ofs++] = 'e';
+			str[ofs++] = 'f';
+			str[ofs++] = 't';
+		break;
+		case TUIK_RIGHT:
+			str[ofs++] = 'R';
+			str[ofs++] = 'i';
+			str[ofs++] = 'g';
+			str[ofs++] = 'h';
+			str[ofs++] = 't';
+		break;
+		case TUIK_UP:
+			str[ofs++] = 'U';
+			str[ofs++] = 'p';
+		break;
+		case TUIK_DOWN:
+			str[ofs++] = 'D';
+			str[ofs++] = 'o';
+			str[ofs++] = 'w';
+			str[ofs++] = 'n';
+		break;
+		case TUIK_PAGEDOWN:
+			str[ofs++] = 'P';
+			str[ofs++] = 'a';
+			str[ofs++] = 'g';
+			str[ofs++] = 'e';
+			str[ofs++] = 'D';
+			str[ofs++] = 'o';
+			str[ofs++] = 'w';
+			str[ofs++] = 'n';
+		break;
+		case TUIK_PAGEUP:
+			str[ofs++] = 'P';
+			str[ofs++] = 'a';
+			str[ofs++] = 'g';
+			str[ofs++] = 'e';
+			str[ofs++] = 'U';
+			str[ofs++] = 'p';
+		break;
+		case TUIK_HOME:
+			str[ofs++] = 'H';
+			str[ofs++] = 'o';
+			str[ofs++] = 'm';
+			str[ofs++] = 'e';
+		break;
+		case TUIK_END:
+			str[ofs++] = 'E';
+			str[ofs++] = 'n';
+			str[ofs++] = 'd';
+		break;
+		case TUIK_INSERT:
+			str[ofs++] = 'I';
+			str[ofs++] = 'n';
+			str[ofs++] = 's';
+			str[ofs++] = 'e';
+			str[ofs++] = 'r';
+			str[ofs++] = 't';
+		break;
+		case TUIK_DELETE:
+			str[ofs++] = 'D';
+			str[ofs++] = 'e';
+			str[ofs++] = 'l';
+		break;
 		default:
 			fprintf(stderr, "missing key %d\n", ksym);
-			return;
+		return;
 		}
 	}
 
@@ -521,6 +599,22 @@ static struct tui_context* nvim_grid_to_tui(const msgpack_object_array* arg)
 		arg->ptr[1].via.array.size < 1 ||
 		arg->ptr[1].via.array.ptr[0].type != MSGPACK_OBJECT_POSITIVE_INTEGER)
 		return NULL;
+
+/* find matching and if not, grab first free and set the grid-id, request
+ * a new tui window for it - since this is asynch and we need a context
+ * directly to make things easier
+ *
+ * The solution to that is to extend tui with the option of making a
+ * 'connectionless- tui' window that behaves like a normal one, but won't
+ * refresh / transfer / do anything. Then when we get a subwindow event, we can
+ * quickly transfer this with a 'window_bind' call.
+ */
+	if (nvim.multigrid){
+		uint64_t grid_id = arg->ptr[1].via.array.ptr[0].via.u64;
+		for (size_t i = 0; i < nvim.n_grids; i++){
+		}
+	}
+
 /* incomplete, need to map grid to active context */
 	return nvim.grids[0];
 }
@@ -1064,17 +1158,14 @@ static void* thread_input(void* data)
 			const msgpack_object* const o = &result.data;
 			const msgpack_object_array* const args = &(o->via.array);
 
-#ifdef TRACE_ENABLED
-#define DETAILED_TRACE
-#ifdef DETAILED_TRACE
-msgpack_object_print(stderr, *o);
-fputs("\n", stderr);
-fflush(stderr);
-#endif
-#endif
+			if (nvim.trace_out){
+				msgpack_object_print(nvim.trace_out, *o);
+				fputs("\n", nvim.trace_out);
+				fflush(nvim.trace_out);
+			}
 
  			if (args->size != 3 && args->size != 4){
-				fprintf(stderr, "invalid object size");
+				fprintf(nvim.trace_out, "invalid object size");
 				continue;
 			}
 			switch(args->ptr[0].via.u64){
@@ -1177,7 +1268,17 @@ static void setup_nvim_ui()
 	msgpack_pack_int64(nvim.out, 128);
 	msgpack_pack_int64(nvim.out, 32);
 
-	msgpack_pack_map(nvim.out, 2);
+	size_t n_opts = 2;
+	if (nvim.multigrid)
+		n_opts++;
+
+	if (nvim.messages)
+		n_opts++;
+
+	if (nvim.popups)
+		n_opts++;
+
+	msgpack_pack_map(nvim.out, n_opts);
 
 /* truecolor of course */
 	{
@@ -1193,19 +1294,37 @@ static void setup_nvim_ui()
 	msgpack_pack_true(nvim.out);
 	}
 
-/* we can deal with multiple grids (one mapped to a segment)
- *
-	{
-	msgpack_pack_str(nvim.out, 13);
-	msgpack_pack_str_body(nvim.out, "ext_multigrid", 13);
-	msgpack_pack_true(nvim.out);
+/* we can deal with multiple grids, either composed or split */
+	if (nvim.multigrid){
+		msgpack_pack_str(nvim.out, 13);
+		msgpack_pack_str_body(nvim.out, "ext_multigrid", 13);
+		msgpack_pack_true(nvim.out);
 	}
- */
 
 /*
- * ext_messages to avoid a grid being used for that
+ * ext_messages to avoid a grid being used for that,
+ * enables msg_show events:
+ * kind, content, replace_last - we can put those as alerts with shmif, but tui
+ * does not have a way of exposing it currently.
  *
+ * and msg_clear: (remove all)
+ * and msg_showmode, msg_content, msg_ruler, msg_history_show
  */
+	if (nvim.messages){
+	msgpack_pack_str(nvim.out, 12);
+	msgpack_pack_str_body(nvim.out, "ext_messages", 12);
+	msgpack_pack_true(nvim.out);
+	}
+
+/* enables popupmenu_select (ind),
+ * popupmenu_show (items, selected, row, col, grid)
+ * if grid is -1 it is tied to the command-line and col is byte-pos
+ * and popupmenu_hide */
+	if (nvim.popups){
+	msgpack_pack_str(nvim.out, 13);
+	msgpack_pack_str_body(nvim.out, "ext_popupmenu", 13);
+	msgpack_pack_true(nvim.out);
+	}
 
 /* ext_popupmenu? ext_tabline? */
 }
@@ -1253,10 +1372,15 @@ int main(int argc, char** argv)
 	}
 
 	FILE* data_out;
+	size_t argv_pos = 1;
+	if (argc > argv_pos && strcmp("--multigrid", argv[argv_pos]) == 0){
+		argv_pos++;
+		nvim.multigrid = true;
+	}
 
 	int data_in[2] = {-1};
 
-	if (!setup_nvim_process(argc-1, &argv[1], &data_in[0], &data_out)){
+	if (!setup_nvim_process(argc-1, &argv[argv_pos], &data_in[0], &data_out)){
 		arcan_tui_destroy(nvim.grids[0], "couldn't spawn neovim");
 		return EXIT_FAILURE;
 	}
