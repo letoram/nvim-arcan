@@ -4,6 +4,8 @@
  * Missing / basic things:
  *  - default / background option attribute not set
  *  - clipboard action
+ *  - default color bug with external terminal colors
+ *  - scrolling- garbage screen contents
  *
  * - options to explore:
  * - multiple grids
@@ -117,6 +119,7 @@ static void trace_obj_array(const msgpack_object_array* arg)
 		.type = MSGPACK_OBJECT_ARRAY,
 		.via.array = *arg
 	};
+
 	msgpack_object_print(nvim.trace_out, obj);
 	fprintf(nvim.trace_out, "\n");
 }
@@ -215,6 +218,21 @@ static void build_mouse_packet(
 	msgpack_pack_int(nvim.out, grid);
 	msgpack_pack_int(nvim.out, row);
 	msgpack_pack_int(nvim.out, col);
+}
+
+/*
+ * api complains when we attempt to do this, might be some other way
+ */
+static void request_buffer_contents()
+{
+	const char lines_cmd[] = "nvim_input_get_lines";
+	nvim_request_str(lines_cmd, sizeof(lines_cmd) - 1);
+	msgpack_pack_array(nvim.out, 5);
+	msgpack_pack_int(nvim.out, 0); /* ch */
+	msgpack_pack_int(nvim.out, 0); /* buffer */
+	msgpack_pack_int(nvim.out, 0); /* start */
+	msgpack_pack_int(nvim.out, -1); /* end */
+	msgpack_pack_int(nvim.out, 0); /* overflow? */
 }
 
 static void on_mouse_button(struct tui_context* c,
@@ -797,17 +815,14 @@ static bool grid_scroll(const msgpack_object_array* arg)
 	}
 
 /* scroll down */
-	size_t nr = b - t;
 	if (rows > 0){
-		for (size_t row = 0; row < nr; row++){
-			copy_row(grid, l, r, t + row + rows, t + row);
+		for (int64_t crow = t; crow + rows < b; crow++){
+			copy_row(grid, l, r, crow + rows, crow);
 		}
 	}
-
-	if (rows < 0){
-		rows = -rows;
-		for (size_t row = 1; row < nr; row++){
-			copy_row(grid, l, r, b - row - rows, b - row);
+	else{
+		for (int64_t crow = b - 1; crow + rows >= t; --crow){
+			copy_row(grid, l, r, crow + rows, crow);
 		}
 	}
 
@@ -889,19 +904,19 @@ static bool highlight_attribute(const msgpack_object_array* arg)
 				state->got_bg = true;
 			}
 			else if (nvim_str_match(&cm->ptr[j].key.via.str, "reverse")){
-				state->attr.inverse = true;
+				state->attr.aflags |= TUI_ATTR_INVERSE;
 			}
 			else if (nvim_str_match(&cm->ptr[j].key.via.str, "bold")){
-				state->attr.bold = true;
+				state->attr.aflags |= TUI_ATTR_BOLD;
 			}
 			else if (nvim_str_match(&cm->ptr[j].key.via.str, "underline")){
-				state->attr.underline = true;
+				state->attr.aflags |= TUI_ATTR_UNDERLINE;
 			}
 			else if (nvim_str_match(&cm->ptr[j].key.via.str, "italic")){
-				state->attr.italic = true;
+				state->attr.aflags |= TUI_ATTR_ITALIC;
 			}
 			else if (nvim_str_match(&cm->ptr[j].key.via.str, "strikethrough")){
-				state->attr.strikethrough = true;
+				state->attr.aflags |= TUI_ATTR_STRIKETHROUGH;
 			}
 /* Special: can't be done atm, lacks a way to express it in TUI */
 /* Undercurl: missing attribute in TUI, possible but we are out of bits */
@@ -1027,12 +1042,9 @@ static const struct nvim_cmd redraw_cmds[] = {
 	{"set_icon", set_icon},
 	{"set_title", set_title},
 	{"flush", release_locks}
-/* option_set
+/*
  * set_scroll_region [top, bottom, left, right]
- * grid_scroll [id, top, bot, left, right, rows, cols] n rows direction, - down
- * default_colors_set
  * hl_group_set
- * grid_clear
  * mode_info_set (cursor-shape, cursor-size
  * mode_change
  * flush [release mutex / allow refresh ]
@@ -1160,6 +1172,7 @@ static void* thread_input(void* data)
 
 			if (nvim.trace_out){
 				msgpack_object_print(nvim.trace_out, *o);
+				trace_obj_array(args);
 				fputs("\n", nvim.trace_out);
 				fflush(nvim.trace_out);
 			}
@@ -1325,8 +1338,6 @@ static void setup_nvim_ui()
 	msgpack_pack_str_body(nvim.out, "ext_popupmenu", 13);
 	msgpack_pack_true(nvim.out);
 	}
-
-/* ext_popupmenu? ext_tabline? */
 }
 
 static struct tui_cbcfg setup_nvim(int id)
@@ -1371,11 +1382,31 @@ int main(int argc, char** argv)
 		return EXIT_FAILURE;
 	}
 
+	const char* tracefn = getenv("NVIM_ARCAN_TRACE");
+	if (tracefn){
+		if (strcmp(tracefn, "-") == 0)
+			nvim.trace_out = stderr;
+		else
+			nvim.trace_out = fopen(tracefn, "w");
+	}
+
 	FILE* data_out;
 	size_t argv_pos = 1;
-	if (argc > argv_pos && strcmp("--multigrid", argv[argv_pos]) == 0){
+	while (argc > argv_pos){
+		if (strcmp("--multigrid", argv[argv_pos]) == 0){
+			nvim.multigrid = true;
+		}
+		else if (strcmp("--popup", argv[argv_pos]) == 0){
+			nvim.popups = true;
+		}
+		else if (strcmp("--messages", argv[argv_pos]) == 0){
+			nvim.messages = true;
+		}
+/* forward to nvim at first unknown position */
+		else
+			break;
+
 		argv_pos++;
-		nvim.multigrid = true;
 	}
 
 	int data_in[2] = {-1};
