@@ -27,6 +27,7 @@
 #include <stdatomic.h>
 #include <errno.h>
 #include <ctype.h>
+#include <signal.h>
 #include "uthash.h"
 
 #ifndef COUNT_OF
@@ -85,6 +86,20 @@ static struct {
 	int sigfd;
 	int lock_level;
 
+/*
+ * Used for outgoing bchunk requests (buffer copies), while there is strictly
+ * no way to limit the number of outstanding copies here, at this level of
+ * saturation there is a point to just block tui processing because this will
+ * just amplify. The better option would be a way to forward this to the
+ * vim process itself, but that seems ever worse of (msgpack and fd passing..)
+ */
+	struct {
+		int fd;
+		uint32_t reqid;
+		size_t pos;
+		void (*data)(size_t i, const msgpack_object_array*);
+	} pending[8];
+
 	FILE* trace_out;
 } nvim = {
 	.synch = PTHREAD_MUTEX_INITIALIZER,
@@ -137,7 +152,8 @@ static uint32_t nvim_request_str(const char* str, size_t sz)
 	return id;
 }
 
-static uint32_t nvim_set_key_i(const char* key, int val)
+/*
+ * static uint32_t nvim_set_key_i(const char* key, int val)
 {
 	uint32_t id = nvim.reqid++;
 	size_t klen = strlen(key);
@@ -149,6 +165,7 @@ static uint32_t nvim_set_key_i(const char* key, int val)
 
 	return id;
 }
+ */
 
 static bool nvim_str_match(
 	const msgpack_object_str* instr, const char* msg)
@@ -220,19 +237,59 @@ static void build_mouse_packet(
 	msgpack_pack_int(nvim.out, col);
 }
 
+static void handle_buffer_response(size_t i, const msgpack_object_array* arg)
+{
+	trace("buffer-response");
+
+/* for larger responses we have the problem that this is blocking and nvim
+ * stops being responsive in the interim, so in that case we should, at least,
+ * forward progress about the transfer */
+	FILE* fout = fdopen(nvim.pending[i].fd, "w");
+	if (!fout){
+		close(nvim.pending[i].fd);
+		return;
+	}
+
+	for (size_t i = 0; i < arg->size; i++){
+		if (arg->ptr[i].type != MSGPACK_OBJECT_STR)
+			continue;
+
+		fprintf(fout, "%.*s\n", arg->ptr[i].via.str.size, arg->ptr[i].via.str.ptr);
+	}
+
+	fclose(fout);
+}
+
 /*
  * api complains when we attempt to do this, might be some other way
  */
-static void request_buffer_contents()
+static void request_buffer_contents(int fd)
 {
-	const char lines_cmd[] = "nvim_input_get_lines";
-	nvim_request_str(lines_cmd, sizeof(lines_cmd) - 1);
-	msgpack_pack_array(nvim.out, 5);
-	msgpack_pack_int(nvim.out, 0); /* ch */
+/* some optimization opportunity here by checking if there exists more pending
+ * transfers that are at pos 0 and re-using the same request on them. */
+	size_t i = 0;
+	for (; i < COUNT_OF(nvim.pending); i++){
+		if (nvim.pending[i].fd <= 0){
+			nvim.pending[i].fd = fd;
+			nvim.pending[i].pos = 0;
+			nvim.pending[i].data = handle_buffer_response;
+			break;
+		}
+	}
+
+	if (i == COUNT_OF(nvim.pending)){
+		close(fd);
+		return;
+	}
+
+	const char lines_cmd[] = "nvim_buf_get_lines";
+	uint32_t id = nvim_request_str(lines_cmd, sizeof(lines_cmd) - 1);
+	msgpack_pack_array(nvim.out, 4);
 	msgpack_pack_int(nvim.out, 0); /* buffer */
 	msgpack_pack_int(nvim.out, 0); /* start */
 	msgpack_pack_int(nvim.out, -1); /* end */
 	msgpack_pack_int(nvim.out, 0); /* overflow? */
+	nvim.pending[i].reqid = id;
 }
 
 static void on_mouse_button(struct tui_context* c,
@@ -312,7 +369,7 @@ static void on_mouse(struct tui_context* c,
 }
 
 static void on_key(struct tui_context* c, uint32_t ksym,
-	uint8_t scancode, uint8_t mods, uint16_t subid, void* t)
+	uint8_t scancode, uint16_t mods, uint16_t subid, void* t)
 {
 	trace("unknown_key(%"PRIu32",%"PRIu8",%"PRIu16")", ksym, scancode, subid);
 
@@ -337,7 +394,6 @@ static void on_key(struct tui_context* c, uint32_t ksym,
 		str[ofs++] = 'M';
 		str[ofs++] = '-';
 	}
-
 
 /* is the keysym part of the visible set? then just add it like that */
 /* otherwise follow the special treatment for various things */
@@ -515,8 +571,14 @@ static void on_state(struct tui_context* c, bool input, int fd, void* t)
 }
 
 static void on_bchunk(struct tui_context* c,
-	bool input, uint64_t size, int fd, void* t)
+	bool input, uint64_t size, int fd, const char* type, void* t)
 {
+	if (!input){
+		request_buffer_contents(fd);
+	}
+	else
+		close(fd);
+
 	trace("on_bchunk(%"PRIu64", in:%d)", size, (int)input);
 }
 
@@ -628,7 +690,7 @@ static struct tui_context* nvim_grid_to_tui(const msgpack_object_array* arg)
  * quickly transfer this with a 'window_bind' call.
  */
 	if (nvim.multigrid){
-		uint64_t grid_id = arg->ptr[1].via.array.ptr[0].via.u64;
+/*		uint64_t grid_id = arg->ptr[1].via.array.ptr[0].via.u64; */
 		for (size_t i = 0; i < nvim.n_grids; i++){
 		}
 	}
@@ -714,7 +776,7 @@ static bool draw_lines(const msgpack_object_array* arg)
 			continue;
 
 		const msgpack_object_array* l = &arg->ptr[line].via.array;
-		if (l->size != 4)
+		if (l->size < 4)
 			return false;
 
 /* invalid grid number argument */
@@ -1077,7 +1139,7 @@ static void nvim_redraw(const msgpack_object_array* arg)
 				found = true;
 
 				if (!redraw_cmds[j].ptr(iarg)){
-					trace("parsing failed on redraw:%.*s", str->size, str->ptr);
+					trace("parsing failed on redraw(%s):%.*s", redraw_cmds[j].lbl, str->size, str->ptr);
 				}
 
 				break;
@@ -1155,12 +1217,15 @@ static void* thread_input(void* data)
 		if (-1 == (nr = read(fdin, buffer, sz))){
 			if (errno == EAGAIN || errno == EINTR)
 				continue;
+			trace("read error: %d", errno);
 			break;
 		}
 
 /* pipe dead */
-		if (0 == nr)
+		if (0 == nr){
+			trace("dead-read");
 			break;
+		}
 
 		msgpack_unpacker_buffer_consumed(&unpack, nr);
 
@@ -1185,8 +1250,21 @@ static void* thread_input(void* data)
 			case 0:
 				trace("request");
 			break;
+/* didn't find a good source on the reply format, be careful here when
+ * adding more request types where the response is interesting */
 			case 1:
-				trace("response");
+				for (size_t i = 0; i < COUNT_OF(nvim.pending); i++){
+
+/* another open question here is what happens with buffering / chunking,
+ * do we get arbitrarily long files */
+					if (nvim.pending[i].reqid ==
+						args->ptr[1].via.u64 && nvim.pending[i].data &&
+						args->size == 4 && args->ptr[3].type == MSGPACK_OBJECT_ARRAY){
+						nvim.pending[i].data(i, &args->ptr[3].via.array);
+						nvim.pending[i].reqid = 0;
+						break;
+					}
+				}
 			break;
 			case 2:
  			if (args->ptr[1].type == MSGPACK_OBJECT_STR &&
@@ -1245,6 +1323,13 @@ static bool setup_nvim_process(int argc, char** argv, int* in, FILE** out)
 			-1 == dup2(pipe_output[1], STDOUT_FILENO)){
 			return EXIT_FAILURE;
 		}
+
+/* mask out SIGINT so we can debug in peace */
+		setsid();
+		sigset_t block;
+		sigemptyset(&block);
+		sigaddset(&block, SIGINT);
+		sigprocmask(SIG_BLOCK, &block, NULL);
 
 		char* out_argv[argc+4];
 		size_t ofs = 0;
@@ -1428,6 +1513,8 @@ int main(int argc, char** argv)
 
 	setup_nvim_ui();
 
+	arcan_tui_announce_io(nvim.grids[0], false, NULL, "txt");
+
 /* create our input parsing thread */
 	pthread_t pth;
 	pthread_attr_t pthattr;
@@ -1449,16 +1536,20 @@ int main(int argc, char** argv)
 			if (-1 == arcan_tui_refresh(nvim.grids[0]) && errno == EINVAL)
 				break;
 		}
-		else
+		else{
+			trace("tui_process failed");
 			break;
+		}
 
 		pthread_mutex_unlock(&nvim.synch);
 
 		if (res.ok){
 			char cmd;
 			if (read(signalfd, &cmd, 1) == 1){
-				if (cmd == 'q')
+				if (cmd == 'q'){
+					trace("quit-requested");
 					break;
+				}
 				else if (cmd == 'l'){
 					pthread_mutex_lock(&nvim.hold);
 					trace("synch");
